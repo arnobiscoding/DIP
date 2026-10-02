@@ -1121,7 +1121,7 @@ def parse_arguments():
                         help="Learning rate for supervised fine-tuning.")
     parser.add_argument("--benchmark_epochs", type=int, default=20,
                         help="Max epochs per fraction in Stage 3 label-scarcity benchmark.")
-    parser.add_argument("--early_stopping_patience", type=int, default=10,
+    parser.add_argument("--early_stopping_patience", "--patience", dest="early_stopping_patience", type=int, default=10,
                         help="Early stopping patience (epochs without validation improvement). Default: 10.")
     parser.add_argument("--min_delta", type=float, default=1e-4,
                         help="Minimum change threshold in validation metric to qualify as improvement.")
