@@ -4,11 +4,13 @@
 Investigating Contrastive Learning for Vision Transformer-Based Breast
 Histopathological Image Classification under Limited Labeled Data
 ================================================================================
-End-to-End Pipeline Script:
+End-to-End Pipeline Script (Advanced Metric Tracking & Scientific Evidence Suite):
   Stage 1: Self-Supervised Contrastive Pretraining (SimCLR + NT-Xent)
-  Stage 2: Full-Data Supervised Fine-Tuning with Early Stopping
+  Stage 2: Full-Data Supervised Fine-Tuning with Weak/Patient Early Stopping
   Stage 3: Controlled Label-Scarcity Benchmark (10%, 25%, 50%, 75%, 100%)
-  Stage 4: Comprehensive Metrics, Confusion Matrices, ROC & Efficiency Curves
+           with Zero Prior Supervised Contamination
+  Stage 4: Comprehensive Clinical & Statistical Metrics, Prediction Persistence,
+           Checkpoints for All Cases, Delta Gain Analysis, and Publication Plots
 
 Author: Research Team
 Target Platform: Kaggle GPU (Tesla T4 / P100) or Local PyTorch Environment
@@ -56,8 +58,9 @@ except ImportError:
 
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import (
-    accuracy_score, precision_score, recall_score,
-    f1_score, roc_auc_score, confusion_matrix, roc_curve
+    accuracy_score, balanced_accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, average_precision_score, precision_recall_curve,
+    matthews_corrcoef, brier_score_loss, confusion_matrix, roc_curve
 )
 
 
@@ -104,7 +107,6 @@ class PCamHDF5Dataset(Dataset):
         self.y_path = str(y_path)
         self.transform = transform
 
-        # Probe dataset length and keys in an ephemeral context
         with h5py.File(self.x_path, 'r') as fx:
             self.x_key = 'x' if 'x' in fx else list(fx.keys())[0]
             self.length = fx[self.x_key].shape[0]
@@ -139,10 +141,7 @@ class PCamHDF5Dataset(Dataset):
 
 
 class SyntheticPCamDataset(Dataset):
-    """
-    Synthetic in-memory dataset for local debugging and smoke testing
-    when real multi-GB HDF5 files are not present.
-    """
+    """Synthetic in-memory dataset for local debugging when HDF5 files are not present."""
     def __init__(self, num_samples: int = 200, transform=None):
         self.num_samples = num_samples
         self.transform = transform
@@ -163,14 +162,10 @@ class SyntheticPCamDataset(Dataset):
 
 
 def resolve_pcam_paths(data_dir: Path) -> Dict[str, str]:
-    """
-    Scans data directory to locate train, validation, and test HDF5 files.
-    Supports both official 'andrewmvd' structure and flat legacy structures.
-    """
+    """Scans data directory to locate train, validation, and test HDF5 files."""
     paths = {}
     print(f"\nResolving PCam HDF5 files under: {data_dir}")
 
-    # 1. Search for Training Images & Labels
     train_x = list(data_dir.rglob("*training_split.h5")) or list(data_dir.rglob("*train_x.h5"))
     train_y = list(data_dir.rglob("*train_y.h5"))
     if train_x and train_y:
@@ -179,7 +174,6 @@ def resolve_pcam_paths(data_dir: Path) -> Dict[str, str]:
         print(f"  -> Detected Train Images: {paths['train_x']}")
         print(f"  -> Detected Train Labels: {paths['train_y']}")
 
-    # 2. Search for Validation Images & Labels
     val_x = list(data_dir.rglob("*validation_split.h5")) or list(data_dir.rglob("*valid_x.h5"))
     val_y = list(data_dir.rglob("*valid_y.h5"))
     if val_x and val_y:
@@ -188,7 +182,6 @@ def resolve_pcam_paths(data_dir: Path) -> Dict[str, str]:
         print(f"  -> Detected Val Images  : {paths['val_x']}")
         print(f"  -> Detected Val Labels  : {paths['val_y']}")
 
-    # 3. Search for Test Images & Labels
     test_x = list(data_dir.rglob("*test_split.h5")) or list(data_dir.rglob("*test_x.h5"))
     test_y = list(data_dir.rglob("*test_y.h5"))
     if test_x and test_y:
@@ -232,10 +225,7 @@ class FallbackPILTransforms:
 
 
 class ContrastiveTwoViewTransform:
-    """
-    Applies two independent stochastic augmentations to generate positive pairs
-    for self-supervised contrastive learning (SimCLR).
-    """
+    """Applies two independent stochastic augmentations to generate positive pairs."""
     def __init__(self, image_size: int = 224):
         self.image_size = image_size
         if HAS_TORCHVISION:
@@ -303,13 +293,10 @@ class EvalTransform:
 
 
 # ==============================================================================
-# 4. MODEL ARCHITECTURES & NT-XENT CONTRASTIVE LOSS
+# 4. MODEL ARCHITECTURES & NT-XENT LOSS
 # ==============================================================================
 class StandaloneViT(nn.Module):
-    """
-    Compact pure-PyTorch Vision Transformer backbone fallback if timm is not installed.
-    Matches ViT-Tiny specifications: patch size 16, embed dim 192, 4 heads, 6 layers.
-    """
+    """Compact pure-PyTorch Vision Transformer backbone fallback if timm is not installed."""
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=192, depth=6, num_heads=4):
         super().__init__()
         self.num_features = embed_dim
@@ -395,10 +382,7 @@ class ViTClassifier(nn.Module):
 
 
 class NTXentLoss(nn.Module):
-    """
-    Vectorized Normalized Temperature-scaled Cross Entropy Loss (NT-Xent / InfoNCE).
-    Safe for mixed-precision FP16/FP32 autocast.
-    """
+    """Vectorized Normalized Temperature-scaled Cross Entropy Loss (NT-Xent / InfoNCE)."""
     def __init__(self, temperature: float = 0.5):
         super().__init__()
         self.temperature = temperature
@@ -409,12 +393,10 @@ class NTXentLoss(nn.Module):
         z = torch.cat([z1, z2], dim=0) # [2*B, D]
         sim_matrix = torch.matmul(z, z.T) / self.temperature
 
-        # Mask diagonal self-similarity entries
         mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
         min_val = torch.finfo(sim_matrix.dtype).min
         sim_matrix = sim_matrix.masked_fill(mask, min_val)
 
-        # Targets: positive pair is i <-> i+B
         targets = torch.cat([
             torch.arange(batch_size, 2 * batch_size, device=z.device),
             torch.arange(0, batch_size, device=z.device)
@@ -424,7 +406,78 @@ class NTXentLoss(nn.Module):
 
 
 # ==============================================================================
-# 5. TRAINING ENGINES WITH EARLY STOPPING & SCHEDULERS
+# 5. COMPREHENSIVE METRIC EVALUATION ENGINE
+# ==============================================================================
+def evaluate_test_set(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict:
+    """
+    Computes an exhaustive clinical, statistical, and probabilistic metric suite
+    on the held-out test set.
+    """
+    model.eval()
+    all_preds, all_targets, all_probs = [], [], []
+
+    with torch.no_grad():
+        for imgs, lbls in loader:
+            imgs = imgs.to(device)
+            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
+                outputs = model(imgs)
+                probs = torch.softmax(outputs, dim=1)[:, 1]
+                preds = torch.argmax(outputs, dim=1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(lbls.numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    all_targets = np.array(all_targets)
+    all_preds = np.array(all_preds)
+    all_probs = np.array(all_probs)
+
+    # 1. Standard Classification Metrics
+    acc = accuracy_score(all_targets, all_preds)
+    bal_acc = balanced_accuracy_score(all_targets, all_preds)
+    prec = precision_score(all_targets, all_preds, zero_division=0)
+    rec = recall_score(all_targets, all_preds, zero_division=0)
+    f1 = f1_score(all_targets, all_preds, zero_division=0)
+    macro_f1 = f1_score(all_targets, all_preds, average="macro", zero_division=0)
+
+    # 2. Confusion Matrix & Clinical Ratios
+    cm = confusion_matrix(all_targets, all_preds)
+    if cm.shape == (2, 2):
+        tn, fp, fn, tp = cm.ravel()
+    else:
+        tn, fp, fn, tp = 0, 0, 0, 0
+    spec = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+    npv = tn / (tn + fn) if (tn + fn) > 0 else 0.0
+
+    # 3. Global Discriminative & Probabilistic Scores
+    try:
+        auc = roc_auc_score(all_targets, all_probs)
+    except Exception:
+        auc = 0.5
+    try:
+        pr_auc = average_precision_score(all_targets, all_probs)
+    except Exception:
+        pr_auc = 0.5
+    try:
+        mcc = matthews_corrcoef(all_targets, all_preds)
+    except Exception:
+        mcc = 0.0
+    try:
+        brier = brier_score_loss(all_targets, all_probs)
+    except Exception:
+        brier = 1.0
+
+    return {
+        "acc": acc, "bal_acc": bal_acc, "prec": prec, "rec": rec,
+        "spec": spec, "npv": npv, "f1": f1, "macro_f1": macro_f1,
+        "auc": auc, "pr_auc": pr_auc, "mcc": mcc, "brier": brier,
+        "tp": int(tp), "fp": int(fp), "tn": int(tn), "fn": int(fn),
+        "cm": cm, "targets": all_targets, "preds": all_preds, "probs": all_probs
+    }
+
+
+# ==============================================================================
+# 6. TRAINING ENGINES WITH RELAXED EARLY STOPPING & SCHEDULERS
 # ==============================================================================
 def train_contrastive_epoch(
     model: nn.Module,
@@ -495,11 +548,11 @@ def validate_supervised_epoch(
     loader: DataLoader,
     criterion: nn.Module,
     device: torch.device
-) -> Tuple[float, float]:
-    """Evaluates classifier performance on validation set."""
+) -> Tuple[float, float, float]:
+    """Evaluates classifier performance on validation set (Loss, Accuracy, F1)."""
     model.eval()
     total_loss = 0.0
-    correct = 0
+    all_preds, all_lbls = [], []
 
     with torch.no_grad():
         for imgs, lbls in loader:
@@ -510,11 +563,13 @@ def validate_supervised_epoch(
 
             total_loss += loss.item() * imgs.size(0)
             preds = torch.argmax(outputs, dim=1)
-            correct += (preds == lbls).sum().item()
+            all_preds.extend(preds.cpu().numpy())
+            all_lbls.extend(lbls.cpu().numpy())
 
     avg_loss = total_loss / len(loader.dataset)
-    avg_acc = correct / len(loader.dataset)
-    return avg_loss, avg_acc
+    avg_acc = accuracy_score(all_lbls, all_preds)
+    avg_f1 = f1_score(all_lbls, all_preds, zero_division=0)
+    return avg_loss, avg_acc, avg_f1
 
 
 def train_classifier_with_early_stopping(
@@ -525,35 +580,62 @@ def train_classifier_with_early_stopping(
     lr: float,
     weight_decay: float,
     patience: int,
+    min_delta: float,
+    monitor_metric: str,
     device: torch.device,
     desc: str = "Classifier"
-) -> nn.Module:
+) -> Tuple[nn.Module, int, int]:
     """
     Trains classifier with AdamW, CosineAnnealingLR, validation evaluation,
-    and early stopping. Restores best model state.
+    and weakened/relaxed early stopping.
+    Returns: (best_model, best_epoch, total_epochs_trained)
     """
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     criterion = nn.CrossEntropyLoss()
     scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
 
+    # Monitoring logic
+    # monitor_metric in ['loss', 'f1', 'acc']
+    if monitor_metric == "loss":
+        best_score = float("inf")
+    else:
+        best_score = -float("inf")
+
     best_val_loss = float("inf")
     best_val_acc = 0.0
+    best_val_f1 = 0.0
+    best_epoch = 1
     patience_counter = 0
     best_weights = copy.deepcopy(model.state_dict())
+    total_epochs_trained = 0
 
-    print(f"\n--- Training {desc} (Max Epochs: {epochs}, Patience: {patience}) ---")
+    print(f"\n--- Training {desc} (Max Epochs: {epochs}, Patience: {patience}, Metric: {monitor_metric.upper()}) ---")
     for epoch in range(1, epochs + 1):
+        total_epochs_trained = epoch
         t_start = time.time()
         t_loss, t_acc = train_supervised_epoch(model, train_loader, optimizer, criterion, scaler, device)
-        v_loss, v_acc = validate_supervised_epoch(model, val_loader, criterion, device)
+        v_loss, v_acc, v_f1 = validate_supervised_epoch(model, val_loader, criterion, device)
         scheduler.step()
         elapsed = time.time() - t_start
 
-        is_best = v_loss < best_val_loss
-        if is_best:
+        # Check improvement with min_delta
+        if monitor_metric == "loss":
+            improved = (best_score - v_loss) > min_delta
+            current_metric = v_loss
+        elif monitor_metric == "f1":
+            improved = (v_f1 - best_score) > min_delta
+            current_metric = v_f1
+        else:  # 'acc'
+            improved = (v_acc - best_score) > min_delta
+            current_metric = v_acc
+
+        if improved:
+            best_score = current_metric
             best_val_loss = v_loss
             best_val_acc = v_acc
+            best_val_f1 = v_f1
+            best_epoch = epoch
             patience_counter = 0
             best_weights = copy.deepcopy(model.state_dict())
             tag = "*"
@@ -563,59 +645,21 @@ def train_classifier_with_early_stopping(
 
         print(f"  Epoch [{epoch:02d}/{epochs:02d}] {tag} "
               f"Train Loss: {t_loss:.4f} | Acc: {t_acc*100:.2f}% || "
-              f"Val Loss: {v_loss:.4f} | Acc: {v_acc*100:.2f}% | Time: {elapsed:.1f}s")
+              f"Val Loss: {v_loss:.4f} | Acc: {v_acc*100:.2f}% | F1: {v_f1:.4f} | Time: {elapsed:.1f}s")
 
         if patience_counter >= patience:
-            print(f"  --> Early stopping triggered at Epoch {epoch}. Best Val Loss: {best_val_loss:.4f} (Acc: {best_val_acc*100:.2f}%)")
+            print(f"  --> Early stopping triggered at Epoch {epoch} (Patience: {patience}). Best at Epoch {best_epoch} (Val F1: {best_val_f1:.4f}, Loss: {best_val_loss:.4f})")
             break
 
-    # Restore best validation weights
     model.load_state_dict(best_weights)
-    return model
-
-
-def evaluate_test_set(model: nn.Module, loader: DataLoader, device: torch.device) -> Dict:
-    """Computes comprehensive clinical metrics on held-out test set."""
-    model.eval()
-    all_preds, all_targets, all_probs = [], [], []
-
-    with torch.no_grad():
-        for imgs, lbls in loader:
-            imgs = imgs.to(device)
-            with autocast(device_type="cuda", enabled=(device.type == "cuda")):
-                outputs = model(imgs)
-                probs = torch.softmax(outputs, dim=1)[:, 1]
-                preds = torch.argmax(outputs, dim=1)
-
-            all_preds.extend(preds.cpu().numpy())
-            all_targets.extend(lbls.numpy())
-            all_probs.extend(probs.cpu().numpy())
-
-    all_targets = np.array(all_targets)
-    all_preds = np.array(all_preds)
-    all_probs = np.array(all_probs)
-
-    acc = accuracy_score(all_targets, all_preds)
-    prec = precision_score(all_targets, all_preds, zero_division=0)
-    rec = recall_score(all_targets, all_preds, zero_division=0)
-    f1 = f1_score(all_targets, all_preds, zero_division=0)
-    try:
-        auc = roc_auc_score(all_targets, all_probs)
-    except Exception:
-        auc = 0.5
-    cm = confusion_matrix(all_targets, all_preds)
-
-    return {
-        "acc": acc, "prec": prec, "rec": rec, "f1": f1, "auc": auc,
-        "cm": cm, "targets": all_targets, "preds": all_preds, "probs": all_probs
-    }
+    return model, best_epoch, total_epochs_trained
 
 
 # ==============================================================================
-# 6. PIPELINE ORCHESTRATION ENGINE
+# 7. PIPELINE ORCHESTRATION ENGINE
 # ==============================================================================
 def run_project(args):
-    """Executes the full experimental pipeline end-to-end."""
+    """Executes the full experimental pipeline with extended metric tracking."""
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     inspect_system(device)
@@ -623,10 +667,10 @@ def run_project(args):
     output_dir = Path(args.output_dir)
     checkpoints_dir = output_dir / "checkpoints"
     results_dir = output_dir / "results"
-    for d in [checkpoints_dir, results_dir]:
+    pred_dir = results_dir / "predictions"
+    for d in [checkpoints_dir, results_dir, pred_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # Save execution config
     with open(output_dir / "config.json", "w") as f:
         json.dump(vars(args), f, indent=4)
 
@@ -651,21 +695,18 @@ def run_project(args):
         contrastive_raw_ds = SyntheticPCamDataset(sample_n, transform=cl_tf)
         supervised_raw_ds  = SyntheticPCamDataset(sample_n, transform=sup_tf)
     else:
-        # Full PCam Dataset
+        eval_tf = EvalTransform(args.image_size)
         full_train_ds = PCamHDF5Dataset(paths["train_x"], paths["train_y"], transform=eval_tf)
 
-        # Load labels for stratification
         with h5py.File(paths["train_y"], 'r') as fy:
             yk = 'y' if 'y' in fy else list(fy.keys())[0]
             raw_labels = np.asarray(fy[yk][:]).ravel()
 
-        # Fixed Canonical Training Pool (e.g., 16,000 samples)
         pool_size = min(args.canonical_train_size, len(full_train_ds))
         sss_pool = StratifiedShuffleSplit(n_splits=1, train_size=pool_size, random_state=args.seed)
         raw_train_indices, _ = next(sss_pool.split(np.zeros(len(raw_labels)), raw_labels))
         all_train_labels = raw_labels[raw_train_indices]
 
-        # Validation Dataset
         if "val_x" in paths and "val_y" in paths:
             val_full = PCamHDF5Dataset(paths["val_x"], paths["val_y"], transform=eval_tf)
             val_indices = np.arange(min(args.canonical_val_size, len(val_full)))
@@ -673,7 +714,6 @@ def run_project(args):
         else:
             val_ds = Subset(full_train_ds, raw_train_indices[:int(pool_size * 0.1)])
 
-        # Test Dataset (using official test split if available)
         if "test_x" in paths and "test_y" in paths:
             test_full = PCamHDF5Dataset(paths["test_x"], paths["test_y"], transform=eval_tf)
             test_indices = np.arange(min(args.canonical_test_size, len(test_full)))
@@ -711,18 +751,15 @@ def run_project(args):
     cl_criterion = NTXentLoss(temperature=args.temperature)
     cl_scaler = GradScaler("cuda", enabled=(device.type == "cuda"))
 
-    cl_history = []
     cl_start = time.time()
     for epoch in range(1, args.contrastive_epochs + 1):
         e_start = time.time()
         ep_loss = train_contrastive_epoch(contrastive_model, contrastive_loader, cl_optimizer, cl_criterion, cl_scaler, device)
         cl_scheduler.step()
-        cl_history.append({"epoch": epoch, "loss": ep_loss})
         print(f"Pretrain Epoch [{epoch:02d}/{args.contrastive_epochs:02d}] | NT-Xent Loss: {ep_loss:.4f} | Time: {time.time() - e_start:.1f}s")
 
     print(f"\nContrastive Pretraining complete in {(time.time() - cl_start)/60:.2f} mins.")
 
-    # Save Pretrained Encoder Checkpoint
     pretrained_encoder_path = checkpoints_dir / "contrastive_vit_pretrained.pth"
     torch.save(contrastive_model.encoder.state_dict(), pretrained_encoder_path)
     print(f"Saved Pretrained Encoder Weights: {pretrained_encoder_path}")
@@ -737,29 +774,29 @@ def run_project(args):
     train_100_subset = Subset(supervised_raw_ds, raw_train_indices)
     train_100_loader = DataLoader(train_100_subset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
 
-    # Initialize Fine-Tuned Model from Contrastive Pretrained Encoder
     finetune_encoder = create_encoder_backbone(args.model_name, pretrained=False)
     finetune_encoder.load_state_dict(torch.load(pretrained_encoder_path, map_location=device))
     finetuned_model = ViTClassifier(finetune_encoder, num_classes=2).to(device)
 
-    finetuned_model = train_classifier_with_early_stopping(
+    finetuned_model, ft_best_ep, ft_tot_ep = train_classifier_with_early_stopping(
         finetuned_model, train_100_loader, val_loader,
         epochs=args.finetune_epochs, lr=args.finetune_lr,
         weight_decay=args.weight_decay, patience=args.early_stopping_patience,
-        device=device, desc="Contrastive ViT (100% Data)"
+        min_delta=args.min_delta, monitor_metric=args.early_stopping_metric,
+        device=device, desc="Contrastive ViT (100% Reference)"
     )
 
-    # Save Best 100% Checkpoint
     best_ft_path = checkpoints_dir / "best_contrastive_finetuned_vit.pth"
     torch.save(finetuned_model.state_dict(), best_ft_path)
 
     metrics_100 = evaluate_test_set(finetuned_model, test_loader, device)
     print("\n--- 100% Full-Data Reference Test Results ---")
-    print(f"Accuracy  : {metrics_100['acc']:.4f}")
-    print(f"F1-Score  : {metrics_100['f1']:.4f}")
-    print(f"ROC-AUC   : {metrics_100['auc']:.4f}")
-    print(f"Recall    : {metrics_100['rec']:.4f}")
-    print(f"Precision : {metrics_100['prec']:.4f}")
+    print(f"Accuracy  : {metrics_100['acc']:.4f} | Bal Acc  : {metrics_100['bal_acc']:.4f}")
+    print(f"F1-Score  : {metrics_100['f1']:.4f} | Macro F1 : {metrics_100['macro_f1']:.4f}")
+    print(f"ROC-AUC   : {metrics_100['auc']:.4f} | PR-AUC   : {metrics_100['pr_auc']:.4f}")
+    print(f"Recall    : {metrics_100['rec']:.4f} | Precision: {metrics_100['prec']:.4f}")
+    print(f"Spec      : {metrics_100['spec']:.4f} | NPV      : {metrics_100['npv']:.4f}")
+    print(f"MCC       : {metrics_100['mcc']:.4f} | Brier    : {metrics_100['brier']:.4f}")
 
     # --------------------------------------------------------------------------
     # STAGE 3: CONTROLLED LABEL-SCARCITY BENCHMARK (10%, 25%, 50%, 75%, 100%)
@@ -767,11 +804,14 @@ def run_project(args):
     print("\n" + "=" * 80)
     print("STAGE 3: CONTROLLED LABEL-SCARCITY BENCHMARK")
     print("=" * 80)
-    print("Protocol: Testing Baseline ViT vs. Contrastive ViT on identical stratified subsets.")
-    print("          Baseline starts from ImageNet weights; Contrastive starts from pretrained encoder.")
+    print("Protocol: Evaluates Baseline ViT vs. Contrastive ViT across all label fractions.")
+    print("          Saves individual checkpoints, raw predictions, and extended metrics for all runs.")
 
     fractions = [0.25, 1.0] if args.debug else args.fractions
     benchmark_records = []
+    roc_data_per_fraction = {}
+    pr_data_per_fraction = {}
+    confusion_matrices_dict = {}
 
     for frac in fractions:
         frac_pct = int(frac * 100)
@@ -788,126 +828,264 @@ def run_project(args):
             batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers
         )
 
-        print(f"\n>>> BENCHMARKING FRACTION: {frac_pct}% ({len(frac_indices)} samples) <<<")
+        print(f"\n=======================================================")
+        print(f">>> BENCHMARKING FRACTION: {frac_pct}% ({len(frac_indices)} samples) <<<")
+        print(f"=======================================================")
 
+        # ----------------------------------------------------------------------
         # 1. Baseline ViT: Trained from fresh ImageNet weights
-        print(f"  [1/2] Training Baseline ViT on {frac_pct}% subset...")
+        # ----------------------------------------------------------------------
+        print(f"\n[1/2] Training Baseline ViT on {frac_pct}% subset...")
+        t0 = time.time()
         base_encoder = create_encoder_backbone(args.model_name, pretrained=(not args.debug))
         baseline_model = ViTClassifier(base_encoder, num_classes=2).to(device)
-        baseline_model = train_classifier_with_early_stopping(
+        baseline_model, b_best_ep, b_tot_ep = train_classifier_with_early_stopping(
             baseline_model, frac_loader, val_loader,
             epochs=args.benchmark_epochs, lr=args.finetune_lr,
-            weight_decay=args.weight_decay, patience=max(3, args.early_stopping_patience - 2),
+            weight_decay=args.weight_decay, patience=args.early_stopping_patience,
+            min_delta=args.min_delta, monitor_metric=args.early_stopping_metric,
             device=device, desc=f"Baseline ViT ({frac_pct}%)"
         )
+        base_train_time = time.time() - t0
         base_res = evaluate_test_set(baseline_model, test_loader, device)
-        benchmark_records.append({
-            "Model": "Baseline ViT",
-            "Fraction": frac,
-            "Label_Percentage": f"{frac_pct}%",
-            "Samples": len(frac_indices),
-            "Accuracy": round(base_res["acc"], 4),
-            "Precision": round(base_res["prec"], 4),
-            "Recall": round(base_res["rec"], 4),
-            "F1_Score": round(base_res["f1"], 4),
-            "ROC_AUC": round(base_res["auc"], 4)
-        })
 
+        # Save individual checkpoint
+        base_ckpt_path = checkpoints_dir / f"baseline_vit_frac_{frac_pct}.pth"
+        torch.save(baseline_model.state_dict(), base_ckpt_path)
+
+        # ----------------------------------------------------------------------
         # 2. Contrastive ViT: Fine-tuned from self-supervised encoder weights
-        print(f"  [2/2] Training Contrastive ViT on {frac_pct}% subset...")
+        # ----------------------------------------------------------------------
+        print(f"\n[2/2] Training Contrastive ViT on {frac_pct}% subset...")
+        t1 = time.time()
         cl_encoder = create_encoder_backbone(args.model_name, pretrained=False)
         cl_encoder.load_state_dict(torch.load(pretrained_encoder_path, map_location=device))
         cl_model = ViTClassifier(cl_encoder, num_classes=2).to(device)
-        cl_model = train_classifier_with_early_stopping(
+        cl_model, cl_best_ep, cl_tot_ep = train_classifier_with_early_stopping(
             cl_model, frac_loader, val_loader,
             epochs=args.benchmark_epochs, lr=args.finetune_lr,
-            weight_decay=args.weight_decay, patience=max(3, args.early_stopping_patience - 2),
+            weight_decay=args.weight_decay, patience=args.early_stopping_patience,
+            min_delta=args.min_delta, monitor_metric=args.early_stopping_metric,
             device=device, desc=f"Contrastive ViT ({frac_pct}%)"
         )
+        cl_train_time = time.time() - t1
         cl_res = evaluate_test_set(cl_model, test_loader, device)
+
+        # Save individual checkpoint
+        cl_ckpt_path = checkpoints_dir / f"contrastive_vit_frac_{frac_pct}.pth"
+        torch.save(cl_model.state_dict(), cl_ckpt_path)
+
+        # ----------------------------------------------------------------------
+        # 3. Save Raw Test Predictions CSV for this fraction
+        # ----------------------------------------------------------------------
+        pred_df = pd.DataFrame({
+            "sample_idx": np.arange(len(base_res["targets"])),
+            "true_label": base_res["targets"],
+            "baseline_prob": base_res["probs"],
+            "baseline_pred": base_res["preds"],
+            "contrastive_prob": cl_res["probs"],
+            "contrastive_pred": cl_res["preds"]
+        })
+        pred_csv_path = pred_dir / f"predictions_frac_{frac_pct}.csv"
+        pred_df.to_csv(pred_csv_path, index=False)
+
+        # Save ROC and PR curve data
+        fpr_b, tpr_b, _ = roc_curve(base_res["targets"], base_res["probs"])
+        fpr_c, tpr_c, _ = roc_curve(cl_res["targets"], cl_res["probs"])
+        prec_b, rec_b, _ = precision_recall_curve(base_res["targets"], base_res["probs"])
+        prec_c, rec_c, _ = precision_recall_curve(cl_res["targets"], cl_res["probs"])
+
+        roc_data_per_fraction[frac_pct] = {"b": (fpr_b, tpr_b, base_res["auc"]), "c": (fpr_c, tpr_c, cl_res["auc"])}
+        pr_data_per_fraction[frac_pct]  = {"b": (rec_b, prec_b, base_res["pr_auc"]), "c": (rec_c, prec_c, cl_res["pr_auc"])}
+        confusion_matrices_dict[frac_pct] = {"b": base_res["cm"], "c": cl_res["cm"]}
+
+        # ----------------------------------------------------------------------
+        # 4. Record Metrics & Delta Gains
+        # ----------------------------------------------------------------------
+        delta_f1 = cl_res["f1"] - base_res["f1"]
+        delta_auc = cl_res["auc"] - base_res["auc"]
+        delta_rec = cl_res["rec"] - base_res["rec"]
+        delta_acc = cl_res["acc"] - base_res["acc"]
+        rel_f1_gain = (delta_f1 / base_res["f1"] * 100) if base_res["f1"] > 0 else 0.0
+
         benchmark_records.append({
-            "Model": "Contrastive ViT",
             "Fraction": frac,
             "Label_Percentage": f"{frac_pct}%",
             "Samples": len(frac_indices),
-            "Accuracy": round(cl_res["acc"], 4),
-            "Precision": round(cl_res["prec"], 4),
-            "Recall": round(cl_res["rec"], 4),
-            "F1_Score": round(cl_res["f1"], 4),
-            "ROC_AUC": round(cl_res["auc"], 4)
+            # Baseline
+            "Baseline_Acc": round(base_res["acc"], 4),
+            "Baseline_BalAcc": round(base_res["bal_acc"], 4),
+            "Baseline_F1": round(base_res["f1"], 4),
+            "Baseline_MacroF1": round(base_res["macro_f1"], 4),
+            "Baseline_AUC": round(base_res["auc"], 4),
+            "Baseline_PRAUC": round(base_res["pr_auc"], 4),
+            "Baseline_Recall": round(base_res["rec"], 4),
+            "Baseline_Precision": round(base_res["prec"], 4),
+            "Baseline_Specificity": round(base_res["spec"], 4),
+            "Baseline_MCC": round(base_res["mcc"], 4),
+            "Baseline_Brier": round(base_res["brier"], 4),
+            "Baseline_BestEpoch": b_best_ep,
+            "Baseline_TotalEpochs": b_tot_ep,
+            "Baseline_TimeSec": round(base_train_time, 1),
+            # Contrastive
+            "Contrastive_Acc": round(cl_res["acc"], 4),
+            "Contrastive_BalAcc": round(cl_res["bal_acc"], 4),
+            "Contrastive_F1": round(cl_res["f1"], 4),
+            "Contrastive_MacroF1": round(cl_res["macro_f1"], 4),
+            "Contrastive_AUC": round(cl_res["auc"], 4),
+            "Contrastive_PRAUC": round(cl_res["pr_auc"], 4),
+            "Contrastive_Recall": round(cl_res["rec"], 4),
+            "Contrastive_Precision": round(cl_res["prec"], 4),
+            "Contrastive_Specificity": round(cl_res["spec"], 4),
+            "Contrastive_MCC": round(cl_res["mcc"], 4),
+            "Contrastive_Brier": round(cl_res["brier"], 4),
+            "Contrastive_BestEpoch": cl_best_ep,
+            "Contrastive_TotalEpochs": cl_tot_ep,
+            "Contrastive_TimeSec": round(cl_train_time, 1),
+            # Contrastive Advantages (Deltas)
+            "Delta_F1": round(delta_f1, 4),
+            "Delta_AUC": round(delta_auc, 4),
+            "Delta_Recall": round(delta_rec, 4),
+            "Delta_Accuracy": round(delta_acc, 4),
+            "Rel_F1_Gain_Pct": round(rel_f1_gain, 2)
         })
 
-        print(f"  [Results at {frac_pct}% Data] "
-              f"Baseline F1: {base_res['f1']:.4f} (AUC: {base_res['auc']:.4f}) | "
-              f"Contrastive F1: {cl_res['f1']:.4f} (AUC: {cl_res['auc']:.4f})")
+        print(f"\n>>> [Summary at {frac_pct}% Labeled Data] <<<")
+        print(f"  • F1-Score   : Baseline = {base_res['f1']:.4f} | Contrastive = {cl_res['f1']:.4f} (Delta: {delta_f1:+.4f})")
+        print(f"  • ROC-AUC    : Baseline = {base_res['auc']:.4f} | Contrastive = {cl_res['auc']:.4f} (Delta: {delta_auc:+.4f})")
+        print(f"  • Recall/Sens: Baseline = {base_res['rec']:.4f} | Contrastive = {cl_res['rec']:.4f} (Delta: {delta_rec:+.4f})")
+        print(f"  • Accuracy   : Baseline = {base_res['acc']:.4f} | Contrastive = {cl_res['acc']:.4f} (Delta: {delta_acc:+.4f})")
 
     # --------------------------------------------------------------------------
-    # STAGE 4: EXPORT RESULTS, TABLES & COMPARATIVE PLOTS
+    # STAGE 4: EXPORT RICH ARTIFACTS & PUBLICATION-GRADE PLOTS
     # --------------------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("STAGE 4: EXPORTING ARTIFACTS & RESEARCH PLOTS")
+    print("STAGE 4: EXPORTING SUMMARY TABLE & COMPARATIVE VISUALIZATIONS")
     print("=" * 80)
 
     df_bench = pd.DataFrame(benchmark_records)
     csv_path = results_dir / "benchmark_summary.csv"
     df_bench.to_csv(csv_path, index=False)
-    print(f"Saved Benchmark Summary Table: {csv_path}")
-    print("\n" + df_bench.to_string(index=False))
+    print(f"Saved Comprehensive Benchmark Summary Table: {csv_path}")
 
-    # Plot F1-Score Efficiency Curve
-    plt.figure(figsize=(9, 5))
-    sns.lineplot(data=df_bench, x="Label_Percentage", y="F1_Score", hue="Model", marker="o", linewidth=2.5)
-    plt.title("Data Efficiency: F1-Score vs. Available Labeled Data", fontsize=13, fontweight="bold")
-    plt.xlabel("Labeled Training Fraction", fontsize=11)
-    plt.ylabel("Test F1-Score", fontsize=11)
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.savefig(results_dir / "f1_efficiency_curve.png", dpi=300, bbox_inches="tight")
+    # Also save a melted tidy version for easy seaborn plotting
+    tidy_rows = []
+    for r in benchmark_records:
+        tidy_rows.append({
+            "Label_Percentage": r["Label_Percentage"], "Fraction": r["Fraction"], "Samples": r["Samples"],
+            "Model": "Baseline ViT", "Accuracy": r["Baseline_Acc"], "F1_Score": r["Baseline_F1"],
+            "ROC_AUC": r["Baseline_AUC"], "Recall": r["Baseline_Recall"], "Precision": r["Baseline_Precision"],
+            "PR_AUC": r["Baseline_PRAUC"], "MCC": r["Baseline_MCC"]
+        })
+        tidy_rows.append({
+            "Label_Percentage": r["Label_Percentage"], "Fraction": r["Fraction"], "Samples": r["Samples"],
+            "Model": "Contrastive ViT", "Accuracy": r["Contrastive_Acc"], "F1_Score": r["Contrastive_F1"],
+            "ROC_AUC": r["Contrastive_AUC"], "Recall": r["Contrastive_Recall"], "Precision": r["Contrastive_Precision"],
+            "PR_AUC": r["Contrastive_PRAUC"], "MCC": r["Contrastive_MCC"]
+        })
+    df_tidy = pd.DataFrame(tidy_rows)
+    df_tidy.to_csv(results_dir / "benchmark_tidy_metrics.csv", index=False)
+
+    # 1. Multi-Metric 4-Panel Efficiency Grid
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    metric_configs = [
+        ("F1_Score", "Test F1-Score (Macro)", axes[0, 0]),
+        ("ROC_AUC", "Area Under ROC Curve (AUC)", axes[0, 1]),
+        ("Recall", "Sensitivity / Recall (Tumor Detection)", axes[1, 0]),
+        ("Accuracy", "Overall Diagnostic Accuracy", axes[1, 1])
+    ]
+    for col_name, title_name, ax in metric_configs:
+        sns.lineplot(
+            data=df_tidy, x="Label_Percentage", y=col_name, hue="Model",
+            marker="o", linewidth=2.5, markersize=8, ax=ax,
+            palette={"Baseline ViT": "#d95f02", "Contrastive ViT": "#1b9e77"}
+        )
+        ax.set_title(title_name, fontsize=12, fontweight="bold")
+        ax.set_xlabel("Available Labeled Training Data", fontsize=10)
+        ax.set_ylabel(col_name, fontsize=10)
+        ax.grid(True, linestyle="--", alpha=0.6)
+    plt.tight_layout()
+    plt.savefig(results_dir / "multi_metric_efficiency.png", dpi=300)
     plt.close()
 
-    # Plot Accuracy Efficiency Curve
-    plt.figure(figsize=(9, 5))
-    sns.lineplot(data=df_bench, x="Label_Percentage", y="Accuracy", hue="Model", marker="s", linewidth=2.5)
-    plt.title("Data Efficiency: Accuracy vs. Available Labeled Data", fontsize=13, fontweight="bold")
-    plt.xlabel("Labeled Training Fraction", fontsize=11)
-    plt.ylabel("Test Accuracy", fontsize=11)
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.savefig(results_dir / "accuracy_efficiency_curve.png", dpi=300, bbox_inches="tight")
+    # 2. Contrastive Advantage Delta Bar Chart
+    fig, ax = plt.subplots(figsize=(10, 5))
+    delta_cols = ["Delta_F1", "Delta_AUC", "Delta_Recall", "Delta_Accuracy"]
+    df_melt_delta = df_bench.melt(
+        id_vars=["Label_Percentage"], value_vars=delta_cols,
+        var_name="Metric_Delta", value_name="Advantage"
+    )
+    sns.barplot(
+        data=df_melt_delta, x="Label_Percentage", y="Advantage", hue="Metric_Delta",
+        palette="viridis", ax=ax
+    )
+    ax.axhline(0, color="black", linestyle="--", linewidth=1)
+    ax.set_title("Contrastive Advantage (Margin over Baseline ViT)", fontsize=13, fontweight="bold")
+    ax.set_xlabel("Labeled Training Fraction", fontsize=11)
+    ax.set_ylabel("Margin (Contrastive - Baseline)", fontsize=11)
+    ax.grid(True, linestyle="--", alpha=0.5)
+    plt.savefig(results_dir / "contrastive_advantage_deltas.png", dpi=300, bbox_inches="tight")
     plt.close()
 
-    # Plot Final Confusion Matrix (for 100% model)
-    plt.figure(figsize=(5, 4))
-    sns.heatmap(metrics_100["cm"], annot=True, fmt="d", cmap="Blues",
-                xticklabels=["Negative (Normal)", "Positive (Tumor)"],
-                yticklabels=["Negative (Normal)", "Positive (Tumor)"])
-    plt.title("Confusion Matrix (100% Fine-Tuned ViT)", fontsize=11, fontweight="bold")
-    plt.ylabel("True Diagnosis")
-    plt.xlabel("Predicted Diagnosis")
-    plt.savefig(results_dir / "confusion_matrix.png", dpi=300, bbox_inches="tight")
+    # 3. Comparative ROC Curves per Fraction
+    n_fracs = len(roc_data_per_fraction)
+    fig, axes = plt.subplots(1, n_fracs, figsize=(5 * n_fracs, 4.5), squeeze=False)
+    for i, (frac_pct, curves) in enumerate(roc_data_per_fraction.items()):
+        ax = axes[0, i]
+        ax.plot(curves["b"][0], curves["b"][1], label=f"Baseline (AUC={curves['b'][2]:.3f})", color="#d95f02", lw=2)
+        ax.plot(curves["c"][0], curves["c"][1], label=f"Contrastive (AUC={curves['c'][2]:.3f})", color="#1b9e77", lw=2)
+        ax.plot([0, 1], [0, 1], "k--", alpha=0.4)
+        ax.set_title(f"ROC Curve ({frac_pct}% Data)", fontsize=11, fontweight="bold")
+        ax.set_xlabel("FPR (1 - Specificity)")
+        ax.set_ylabel("TPR (Recall)")
+        ax.legend(loc="lower right", fontsize=9)
+        ax.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(results_dir / "comparative_roc_curves.png", dpi=300)
     plt.close()
 
-    # Plot ROC Curve
-    fpr, tpr, _ = roc_curve(metrics_100["targets"], metrics_100["probs"])
-    plt.figure(figsize=(6, 5))
-    plt.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC Curve (AUC = {metrics_100['auc']:.4f})")
-    plt.plot([0, 1], [0, 1], color="navy", lw=1.5, linestyle="--")
-    plt.xlabel("False Positive Rate (1 - Specificity)")
-    plt.ylabel("True Positive Rate (Sensitivity / Recall)")
-    plt.title("ROC Characteristic Curve (100% ViT)", fontsize=11, fontweight="bold")
-    plt.legend(loc="lower right")
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.savefig(results_dir / "roc_curve.png", dpi=300, bbox_inches="tight")
+    # 4. Comparative Precision-Recall Curves per Fraction
+    fig, axes = plt.subplots(1, n_fracs, figsize=(5 * n_fracs, 4.5), squeeze=False)
+    for i, (frac_pct, curves) in enumerate(pr_data_per_fraction.items()):
+        ax = axes[0, i]
+        ax.plot(curves["b"][0], curves["b"][1], label=f"Baseline (PR-AUC={curves['b'][2]:.3f})", color="#d95f02", lw=2)
+        ax.plot(curves["c"][0], curves["c"][1], label=f"Contrastive (PR-AUC={curves['c'][2]:.3f})", color="#1b9e77", lw=2)
+        ax.set_title(f"PR Curve ({frac_pct}% Data)", fontsize=11, fontweight="bold")
+        ax.set_xlabel("Recall")
+        ax.set_ylabel("Precision")
+        ax.legend(loc="lower left", fontsize=9)
+        ax.grid(True, linestyle="--", alpha=0.5)
+    plt.tight_layout()
+    plt.savefig(results_dir / "comparative_pr_curves.png", dpi=300)
     plt.close()
 
-    print(f"Generated and saved all comparative visual curves to: {results_dir}")
+    # 5. Confusion Matrices Grid
+    fig, axes = plt.subplots(n_fracs, 2, figsize=(8, 3.5 * n_fracs), squeeze=False)
+    for i, (frac_pct, cms) in enumerate(confusion_matrices_dict.items()):
+        # Baseline
+        sns.heatmap(cms["b"], annot=True, fmt="d", cmap="Oranges", cbar=False, ax=axes[i, 0],
+                    xticklabels=["Normal", "Tumor"], yticklabels=["Normal", "Tumor"])
+        axes[i, 0].set_title(f"Baseline ViT ({frac_pct}% Data)", fontsize=10, fontweight="bold")
+        axes[i, 0].set_ylabel("True Diagnosis")
+        # Contrastive
+        sns.heatmap(cms["c"], annot=True, fmt="d", cmap="Greens", cbar=False, ax=axes[i, 1],
+                    xticklabels=["Normal", "Tumor"], yticklabels=["Normal", "Tumor"])
+        axes[i, 1].set_title(f"Contrastive ViT ({frac_pct}% Data)", fontsize=10, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(results_dir / "confusion_matrices_grid.png", dpi=300)
+    plt.close()
+
+    print(f"All 5 publication plots exported to: {results_dir}")
+    print("Individual checkpoints and prediction CSVs saved.")
     print("\nPipeline execution complete successfully!")
 
 
 # ==============================================================================
-# 7. COMMAND-LINE INTERFACE (CLI)
+# 8. COMMAND-LINE INTERFACE (CLI)
 # ==============================================================================
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description="Run end-to-end Contrastive ViT pipeline for PatchCamelyon classification."
+        description="Run end-to-end Contrastive ViT pipeline with exhaustive metrics & relaxed early stopping."
     )
     parser.add_argument("--data_dir", type=str, default="/kaggle/input",
                         help="Root directory where PCam HDF5 files or datasets are mounted.")
@@ -937,14 +1115,18 @@ def parse_arguments():
                         help="Temperature hyperparameter for NT-Xent loss.")
     parser.add_argument("--projection_dim", type=int, default=128,
                         help="Output dimensionality of the projection head.")
-    parser.add_argument("--finetune_epochs", type=int, default=20,
+    parser.add_argument("--finetune_epochs", type=int, default=25,
                         help="Max epochs for Stage 2 full-data fine-tuning.")
     parser.add_argument("--finetune_lr", type=float, default=1e-4,
                         help="Learning rate for supervised fine-tuning.")
-    parser.add_argument("--benchmark_epochs", type=int, default=15,
+    parser.add_argument("--benchmark_epochs", type=int, default=20,
                         help="Max epochs per fraction in Stage 3 label-scarcity benchmark.")
-    parser.add_argument("--early_stopping_patience", type=int, default=5,
-                        help="Early stopping patience (epochs without validation loss improvement).")
+    parser.add_argument("--early_stopping_patience", type=int, default=10,
+                        help="Early stopping patience (epochs without validation improvement). Default: 10.")
+    parser.add_argument("--min_delta", type=float, default=1e-4,
+                        help="Minimum change threshold in validation metric to qualify as improvement.")
+    parser.add_argument("--early_stopping_metric", type=str, default="loss", choices=["loss", "f1", "acc"],
+                        help="Metric to monitor for early stopping ('loss', 'f1', or 'acc'). Default: 'loss'.")
     parser.add_argument("--weight_decay", type=float, default=1e-4,
                         help="Weight decay for AdamW optimizer.")
     parser.add_argument("--fractions", nargs="+", type=float, default=[0.10, 0.25, 0.50, 0.75, 1.00],
@@ -968,6 +1150,6 @@ if __name__ == "__main__":
         args.canonical_train_size = 40
         args.canonical_val_size = 16
         args.canonical_test_size = 16
-        args.num_workers = 0  # Avoid Windows spawn pickle overhead in debug
+        args.num_workers = 0
 
     run_project(args)

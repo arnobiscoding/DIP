@@ -1,0 +1,21 @@
+# Core Deep Learning Framework
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.9.0
+
+# Medical Image & Data Handling
+h5py>=3.8.0
+Pillow>=9.5.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Evaluation & Metrics
+scikit-learn>=1.2.0
+
+# Visualization & Plotting
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Optional: Kaggle API & Dataset Downloads (if running locally)
+kaggle>=1.5.16
+kagglehub>=0.2.0
